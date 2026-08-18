@@ -98,6 +98,58 @@ def _q(path: str) -> str:
     return "'" + text.replace("'", "'\\''") + "'"
 
 
+def _piecewise_expr(pairs: list[tuple[float, int]], default: int) -> str:
+    """Nested if(lt(t,T),v,...) expression for a crop parameter.
+
+    ``pairs`` = [(change_time, value), ...] in ascending time order.
+    Built back-to-front so the final value is the fallthrough:
+        if(lt(t,T1),V1,if(lt(t,T2),V2,...,Vn))
+    """
+    expr = str(default)
+    for t, v in reversed(pairs):
+        expr = f"if(lt(t,{t:.4f}),{v},{expr})"
+    return expr
+
+
+def crop_expr(boxes: list[tuple[int, int, int, int]], fps: float) -> str:
+    """Per-parameter piecewise time expressions replacing the sendcmd file.
+
+    sendcmd (a command file driving a labeled crop) deadlocks the filter
+    graph on some ffmpeg builds — the render hangs mid-encode with the
+    output file frozen. The crop filter evaluates expressions per frame
+    with ``t`` (frame PTS in seconds), so the same change-point trajectory
+    can be expressed directly: no command file, no external state, no hang.
+    """
+    # Change-points per parameter, starting from boxes[0] at t=0.
+    w_pairs: list[tuple[float, int]] = []
+    h_pairs: list[tuple[float, int]] = []
+    x_pairs: list[tuple[float, int]] = []
+    y_pairs: list[tuple[float, int]] = []
+    prev: tuple[int, int, int, int] | None = None
+    for i, (w, h, x, y) in enumerate(boxes):
+        t = i / fps
+        if prev is None or w != prev[0]:
+            w_pairs.append((t, w))
+        if prev is None or h != prev[1]:
+            h_pairs.append((t, h))
+        if prev is None or x != prev[2]:
+            x_pairs.append((t, x))
+        if prev is None or y != prev[3]:
+            y_pairs.append((t, y))
+        prev = (w, h, x, y)
+
+    w0, h0, x0, y0 = boxes[0]
+    we = _piecewise_expr(w_pairs[1:], w0)
+    he = _piecewise_expr(h_pairs[1:], h0)
+    xe = _piecewise_expr(x_pairs[1:], x0)
+    ye = _piecewise_expr(y_pairs[1:], y0)
+    # crop evaluates its expressions per frame with `t` = frame PTS (s) —
+    # no eval= option (that's an overlay/geq thing). Trajectory change-points
+    # become nested if(lt(t,T),v,...) per parameter. No sendcmd file → no
+    # filter-graph deadlock.
+    return f"crop=w='{we}':h='{he}':x='{xe}':y='{ye}'"
+
+
 def render_clip(
     media_path: str,
     out_path: Path,
@@ -118,13 +170,8 @@ def render_clip(
         boxes = [(src_h * 9 // 16 // 2 * 2, src_h - src_h % 2, 0, 0)]
     fps = float(trajectory.get("fps", 25))
 
-    cmd_path = out_path.with_suffix(".cmd")
-    cmd_path.write_text("\n".join(sendcmd_lines(boxes, fps)) + "\n")
-
-    w0, h0, x0, y0 = boxes[0]
     vf_parts = [
-        f"sendcmd=f={_q(cmd_path)}",
-        f"crop@c=w={w0}:h={h0}:x={x0}:y={y0}",
+        crop_expr(boxes, fps),
         f"scale={OUT_W}:{OUT_H}:flags=lanczos",
         "setsar=1",
     ]
@@ -153,7 +200,6 @@ def render_clip(
         str(out_path),
     ]
     proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    cmd_path.unlink(missing_ok=True)
     if proc.returncode != 0:
         raise RuntimeError(f"Render failed: {(proc.stderr or '')[-800:]}")
 

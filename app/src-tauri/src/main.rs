@@ -142,7 +142,7 @@ fn stream_pipeline(app: &AppHandle, program: &str, args: &[String]) {
     let child = quiet_command(program)
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn();
     let mut child = match child {
         Ok(c) => c,
@@ -154,16 +154,46 @@ fn stream_pipeline(app: &AppHandle, program: &str, args: &[String]) {
             return;
         }
     };
+    let mut last_result_ok: Option<bool> = None;
     if let Some(stdout) = child.stdout.take() {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if value["event"] == "result" {
+                    last_result_ok = value.get("ok").and_then(|v| v.as_bool());
+                }
                 let _ = app.emit("pipeline-event", value);
             }
         }
     }
+    // Capture stderr instead of discarding it: the pipeline's real error is
+    // almost always on stderr (traceback, yt-dlp stderr, model-download
+    // failure). Only a non-zero exit with NO result event needs the raw
+    // tail surfaced — a clean result event already carries the message.
+    let mut stderr_tail: Vec<String> = Vec::new();
+    if let Some(stderr) = child.stderr.take() {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            stderr_tail.push(line);
+            if stderr_tail.len() > 25 {
+                stderr_tail.remove(0);
+            }
+        }
+    }
     if let Ok(status) = child.wait() {
-        if !status.success() {
-            let _ = app.emit("pipeline-event", json!({"event": "exited", "code": status.code()}));
+        if !status.success() && last_result_ok != Some(true) && last_result_ok != Some(false) {
+            // The pipeline died without reporting a result (crash, OOM,
+            // panic). Surface the captured stderr tail — the previous code
+            // sent only "exited unexpectedly" with no detail at all.
+            let detail = stderr_tail.join("\n");
+            let detail = if detail.trim().is_empty() {
+                format!("exit code {}", status.code().unwrap_or(-1))
+            } else {
+                let tail: String = detail.chars().rev().take(3000).collect::<String>().chars().rev().collect();
+                tail
+            };
+            let _ = app.emit(
+                "pipeline-event",
+                json!({"event": "exited", "code": status.code(), "detail": detail}),
+            );
         }
     }
 }

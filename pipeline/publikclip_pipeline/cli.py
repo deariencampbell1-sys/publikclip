@@ -108,6 +108,14 @@ def _execute(job: queue.Job, jsonl: bool) -> int:
     except queue.StageError as err:
         _emit_result(jsonl, {"ok": False, "job_id": job.id, "error": str(err)})
         return 1
+    except Exception as err:  # noqa: BLE001 — a crash must still emit a result event
+        # A non-StageError failure (YtDlpError, model-download error, OOM,
+        # missing artifact, …) used to escape to the top level: the sidecar
+        # died with a bare traceback, the desktop shell saw only a non-zero
+        # exit and showed "The pipeline exited unexpectedly" — the real
+        # error never reached the user. Emit it here so the app can show it.
+        _emit_result(jsonl, {"ok": False, "job_id": job.id, "error": repr(err)})
+        return 1
     summary = {
         "ok": True,
         "job_id": job.id,

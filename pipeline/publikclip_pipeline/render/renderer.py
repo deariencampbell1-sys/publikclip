@@ -21,6 +21,7 @@ CRF and the hardware encoder's bitrate model.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -196,6 +197,24 @@ def _chunk_boxes(
     return chunks
 
 
+FONT_SUFFIXES = {".ttf", ".otf", ".ttc", ".woff", ".woff2"}
+
+
+def _clean_fonts_dir(fonts_dir: Path | None, work_dir: Path) -> Path | None:
+    """libass errors on non-font files inside fontsdir (observed live:
+    OFL-Anton.txt → "Error opening memory font" → filter reinit failure,
+    which deadlocked the old sendcmd path). Hand it a dir with only fonts.
+    """
+    if fonts_dir is None:
+        return None
+    clean = work_dir / ".fonts"
+    clean.mkdir(parents=True, exist_ok=True)
+    for f in sorted(fonts_dir.iterdir()):
+        if f.is_file() and f.suffix.lower() in FONT_SUFFIXES:
+            shutil.copy2(f, clean / f.name)
+    return clean if any(clean.iterdir()) else None
+
+
 def render_clip(
     media_path: str,
     out_path: Path,
@@ -230,6 +249,7 @@ def render_clip(
     # the chunking.
     chunks = _chunk_boxes(boxes, fps)
     part_paths: list[Path] = []
+    fonts_clean = _clean_fonts_dir(fonts_dir, out_path.parent)
     try:
         for chunk in chunks:
             part = out_path.with_name(f"{out_path.stem}.p{len(part_paths)}.mp4")
@@ -238,13 +258,15 @@ def render_clip(
                 media_path, part,
                 clip_start + chunk["t0"], chunk["t1"] - chunk["t0"],
                 chunk["boxes"], fps, clip_start + chunk["t0"],
-                ass_path, fonts_dir, lufs, true_peak, src_w, src_h,
+                ass_path, fonts_clean, lufs, true_peak, src_w, src_h,
                 timeout, vcodec,
             )
         _concat_parts(part_paths, out_path)
     finally:
         for part in part_paths:
             part.unlink(missing_ok=True)
+        if fonts_clean is not None:
+            shutil.rmtree(fonts_clean, ignore_errors=True)
 
 
 def _render_chunk(

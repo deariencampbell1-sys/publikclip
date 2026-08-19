@@ -1,17 +1,27 @@
-"""LLM backends: OpenRouter (default), Bedrock (founder credits), and Ollama
-(local fallback).
+"""LLM backends: auto (production ladder), Bedrock, our gateway, OpenRouter,
+and Ollama (local fallback).
 
 One interface: generate_json(prompt, schema, images) → dict, with disk
 caching keyed on (backend, model, prompt, schema, images) so re-runs never
 re-spend — the M2 gate requires cache hits on identical inputs.
 
+Production ladder (llm_mode "auto", the default):
+1. bedrock      — AWS founder credits, boto3 default chain (local: `aws login`)
+2. gateway      — our RHOBEAR agent gateway (OpenAI-compatible, 127.0.0.1:8780)
+3. openrouter   — BYO key, last-resort remote
+4. (never) ollama — explicitly selected only
+
 Key resolution per backend:
-- openrouter: PUBLIKCLIP_OPENROUTER_API_KEY env var, then
-  PUBLIKCLIP_HOME/secrets.json {"openrouter_api_key": "..."}. Model from
-  PUBLIKCLIP_OPENROUTER_MODEL (default z-ai/glm-4.5v — vision + strong JSON).
 - bedrock: boto3 default credential chain (no key arguments, matches the
   RHOBEAR gateway seam). Model from PUBLIKCLIP_BEDROCK_MODEL (default
   amazon.nova-pro-v1:0), region from PUBLIKCLIP_BEDROCK_REGION or AWS_REGION.
+- gateway: PUBLIKCLIP_GATEWAY_URL (default http://127.0.0.1:8780/v1), key
+  from RHOBEAR_GATEWAY_KEY env or secrets.json "rhobear_gateway_key", model
+  from PUBLIKCLIP_GATEWAY_MODEL (default claude-cli/opus-4-8 — subscription
+  route through the router).
+- openrouter: PUBLIKCLIP_OPENROUTER_API_KEY env var, then
+  PUBLIKCLIP_HOME/secrets.json {"openrouter_api_key": "..."}. Model from
+  PUBLIKCLIP_OPENROUTER_MODEL (default z-ai/glm-4.5v — vision + strong JSON).
 - ollama: no key — just a running daemon.
 """
 
@@ -30,6 +40,8 @@ from .. import config
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = os.environ.get("PUBLIKCLIP_OPENROUTER_MODEL", "z-ai/glm-4.5v")
 BEDROCK_MODEL = os.environ.get("PUBLIKCLIP_BEDROCK_MODEL", "amazon.nova-pro-v1:0")
+GATEWAY_URL = os.environ.get("PUBLIKCLIP_GATEWAY_URL", "http://127.0.0.1:8780/v1")
+GATEWAY_MODEL = os.environ.get("PUBLIKCLIP_GATEWAY_MODEL", "claude-cli/opus-4-8")
 OLLAMA_URL = "http://localhost:11434"
 LLM_TIMEOUT = 120.0
 
@@ -320,12 +332,116 @@ class BedrockClient:
 def make_client(llm_mode: str):
     if llm_mode == "gemini":  # jobs created before the provider swap
         llm_mode = "openrouter"
+    if llm_mode == "auto":
+        return AutoClient()
     if llm_mode == "ollama":
         return OllamaClient()
     if llm_mode == "openrouter":
         return OpenRouterClient()
+    if llm_mode == "gateway":
+        return GatewayClient()
     if llm_mode == "bedrock":
         return BedrockClient()
     raise LlmError(
-        f"Unknown llm_mode {llm_mode!r} — use openrouter, bedrock, or ollama."
+        f"Unknown llm_mode {llm_mode!r} — use auto, bedrock, gateway, openrouter, or ollama."
     )
+
+
+class GatewayClient:
+    """Our RHOBEAR agent gateway — OpenAI-compatible chat completions.
+
+    This is the "our agents" production line: the router normalizes slugs
+    like claude-cli/opus-4-8 onto the Claude subscription and Bedrock routes.
+    """
+
+    backend = "gateway"
+    supports_vision = True
+
+    def __init__(self, model: str | None = None):
+        self.model = model or GATEWAY_MODEL
+        self.base_url = GATEWAY_URL.rstrip("/")
+        key = os.environ.get("RHOBEAR_GATEWAY_KEY") or _secrets_value("rhobear_gateway_key")
+        if not key:
+            raise LlmError(
+                "No RHOBEAR_GATEWAY_KEY found — the gateway needs its key (set the env var "
+                "or add \"rhobear_gateway_key\" to secrets.json)."
+            )
+        self._key = key
+
+    def generate_json(
+        self, prompt: str, schema: dict, images: list[bytes] | None = None
+    ) -> dict:
+        images = images or []
+        cache_file = _cache_dir() / f"{_cache_key(self.backend, self.model, prompt, schema, images)}.json"
+        if cache_file.exists():
+            return json.loads(cache_file.read_text())
+
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for img in images:
+            import base64
+
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{base64.b64encode(img).decode()}"},
+            })
+        body = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.2,
+            "max_tokens": 2000,
+        }
+        try:
+            res = httpx.post(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self._key}"},
+                json=body,
+                timeout=LLM_TIMEOUT,
+            )
+            if res.status_code in (401, 403):
+                raise LlmError("RHOBEAR gateway rejected the key.")
+            res.raise_for_status()
+            payload = res.json()
+            if payload.get("error"):
+                raise LlmError(f"RHOBEAR gateway: {payload['error']}")
+            text = payload["choices"][0]["message"]["content"]
+            data = _validated(json.loads(_strip_fences(text)), schema)
+        except LlmError:
+            raise
+        except (httpx.HTTPError, KeyError, json.JSONDecodeError, IndexError, TypeError) as err:
+            raise LlmError(f"RHOBEAR gateway call failed: {err}") from err
+        cache_file.write_text(json.dumps(data))
+        return data
+
+
+class AutoClient:
+    """Production ladder: bedrock → gateway → openrouter, per call.
+
+    Backends are constructed once; a failing call falls through to the next
+    backend and the working one keeps serving for the rest of the job.
+    """
+
+    backend = "auto"
+    supports_vision = True
+
+    def __init__(self):
+        self._clients: list = []
+        self._errors: list[str] = []
+        for factory in (BedrockClient, GatewayClient, OpenRouterClient):
+            try:
+                self._clients.append(factory())
+            except LlmError as err:
+                self._errors.append(str(err))
+        if not self._clients:
+            raise LlmError("no LLM backends available: " + "; ".join(self._errors))
+
+    def generate_json(
+        self, prompt: str, schema: dict, images: list[bytes] | None = None
+    ) -> dict:
+        errors = list(self._errors)
+        for client in self._clients:
+            try:
+                return client.generate_json(prompt, schema, images)
+            except LlmError as err:
+                errors.append(f"{client.backend}: {err}")
+        raise LlmError("all LLM backends failed: " + "; ".join(errors))

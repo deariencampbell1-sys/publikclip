@@ -60,13 +60,17 @@ open /Applications/publikclip.app
 
 The app downloads its speech/audio models (~4–5 GB) on first run with a
 progress UI, and fetches a caption-capable static ffmpeg automatically if the
-machine has none. Scoring runs on OpenRouter by default (BYO key —
-`PUBLIKCLIP_OPENROUTER_API_KEY`, default model `z-ai/glm-4.5v`), on
-Amazon Bedrock (founder credits, boto3 default chain,
-`amazon.nova-pro-v1:0`), on Gemini (legacy), or on a local Ollama
-model at reduced scoring quality. Switch with the `llm_mode` setting
-(`openrouter` | `bedrock` | `gemini` | `ollama`) or the
-`--llm` CLI flag; keys resolve from env vars or
+machine has none. Scoring runs on the production ladder by default
+(`llm_mode` = `auto`): **Amazon Bedrock first** (founder credits, boto3
+default chain, `amazon.nova-pro-v1:0`), then **our RHOBEAR agent gateway**
+(`http://127.0.0.1:8780/v1`, `RHOBEAR_GATEWAY_KEY`, `claude-cli/opus-4-8`
+subscription route), then **OpenRouter** (BYO key,
+`PUBLIKCLIP_OPENROUTER_API_KEY`, default model `z-ai/glm-4.5v`) as
+last-resort remote, and finally a local Ollama model at reduced scoring
+quality if you select it explicitly. Each failing backend falls through to
+the next with its reason recorded. Pick a single backend with the
+`llm_mode` setting (`auto` | `bedrock` | `gateway` | `openrouter` |
+`ollama`) or the `--llm` CLI flag; keys resolve from env vars or
 `PUBLIKCLIP_HOME/secrets.json`.
 model at reduced scoring quality — onboarding walks through both.
 

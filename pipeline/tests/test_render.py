@@ -79,6 +79,18 @@ def test_ass_no_word_scaling():
 
 
 @pytest.mark.slow
+def test_crop_expr_constant_window_recenters_on_focal_center():
+    """The zoom-free fallback must keep w/h constant (ffmpeg crop cannot
+    resize mid-stream) and recenter the window on each box's focal center."""
+    n = 10
+    # Window = 800x800 inside a 1600x1600 source; then a 2x punch-in at
+    # focal center (500, 280) — the window must recenter to (100, 0).
+    boxes = [(800, 800, 0, 0)] * 5 + [(400, 400, 300, 80)] * 5
+    expr = renderer.crop_expr(boxes, 25.0, 1600, 1600)
+    assert expr.startswith("crop=w=800:h=800:")
+    assert "if(lt(t,0.2000),100" in expr
+
+
 def test_render_smoke(tmp_path):
     """Full path: synthetic source → sendcmd crop with a mid-clip cut →
     caption burn → verified 9:16 output."""

@@ -1,12 +1,20 @@
-"""LLM backends: Gemini (BYO key, default) and Ollama (local fallback).
+"""LLM backends: OpenRouter (default), Bedrock (founder credits), Gemini
+(legacy), and Ollama (local fallback).
 
 One interface: generate_json(prompt, schema, images) → dict, with disk
-caching keyed on (backend, model, prompt, schema) so re-runs never re-spend
-— the M2 gate requires cache hits on identical inputs.
+caching keyed on (backend, model, prompt, schema, images) so re-runs never
+re-spend — the M2 gate requires cache hits on identical inputs.
 
-Key resolution: PUBLIKCLIP_GEMINI_API_KEY env var, then
-PUBLIKCLIP_HOME/secrets.json {"gemini_api_key": "..."} (written by the
-app's onboarding). Ollama needs no key — just a running daemon.
+Key resolution per backend:
+- openrouter: PUBLIKCLIP_OPENROUTER_API_KEY env var, then
+  PUBLIKCLIP_HOME/secrets.json {"openrouter_api_key": "..."}. Model from
+  PUBLIKCLIP_OPENROUTER_MODEL (default z-ai/glm-4.5v — vision + strong JSON).
+- bedrock: boto3 default credential chain (no key arguments, matches the
+  RHOBEAR gateway seam). Model from PUBLIKCLIP_BEDROCK_MODEL (default
+  amazon.nova-pro-v1:0), region from PUBLIKCLIP_BEDROCK_REGION or AWS_REGION.
+- gemini (legacy): PUBLIKCLIP_GEMINI_API_KEY env var, then secrets.json
+  {"gemini_api_key": "..."} (written by the app's onboarding).
+- ollama: no key — just a running daemon.
 """
 
 from __future__ import annotations
@@ -26,6 +34,9 @@ from .. import config
 # longer available to new users" on gemini-2.5-flash with a fresh key).
 GEMINI_MODEL = "gemini-flash-latest"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = os.environ.get("PUBLIKCLIP_OPENROUTER_MODEL", "z-ai/glm-4.5v")
+BEDROCK_MODEL = os.environ.get("PUBLIKCLIP_BEDROCK_MODEL", "amazon.nova-pro-v1:0")
 OLLAMA_URL = "http://localhost:11434"
 LLM_TIMEOUT = 120.0
 
@@ -75,6 +86,7 @@ def _strip_fences(text: str) -> str:
 
 class GeminiClient:
     backend = "gemini"
+    supports_vision = True
 
     def __init__(self, model: str = GEMINI_MODEL):
         self.model = model
@@ -150,6 +162,7 @@ class GeminiClient:
 
 class OllamaClient:
     backend = "ollama"
+    supports_vision = False
 
     def __init__(self, model: str | None = None):
         try:
@@ -157,7 +170,7 @@ class OllamaClient:
             res.raise_for_status()
         except httpx.HTTPError as err:
             raise LlmError(
-                "Ollama isn't running. Start it (`ollama serve`) or switch to Gemini mode."
+                "Ollama isn't running. Start it (`ollama serve`) or switch to openrouter/bedrock mode."
             ) from err
         models = [m["name"] for m in res.json().get("models", [])]
         if not models:
@@ -210,7 +223,162 @@ def _pick_ollama_model(models: list[str]) -> str:
     return models[0]
 
 
+def _secrets_value(key_name: str) -> str | None:
+    """Read a named secret from PUBLIKCLIP_HOME/secrets.json."""
+    secrets_path = config.home_dir() / "secrets.json"
+    if secrets_path.exists():
+        try:
+            return json.loads(secrets_path.read_text()).get(key_name)
+        except (json.JSONDecodeError, OSError):
+            return None
+    return None
+
+
+class OpenRouterClient:
+    """OpenAI-compatible chat completions via OpenRouter (BYO key).
+
+    Vision-capable by default: images are embedded as data URLs, and the
+    selected model is expected to accept them (z-ai/glm-4.5v does). JSON is
+    requested via response_format json_object plus schema-in-prompt.
+    """
+
+    backend = "openrouter"
+    supports_vision = True
+
+    def __init__(self, model: str | None = None):
+        self.model = model or OPENROUTER_MODEL
+        key = os.environ.get("PUBLIKCLIP_OPENROUTER_API_KEY") or _secrets_value("openrouter_api_key")
+        if not key:
+            raise LlmError(
+                "No OpenRouter API key found. Add one in Settings (or set "
+                "PUBLIKCLIP_OPENROUTER_API_KEY), or switch to Bedrock/Ollama mode."
+            )
+        self._key = key
+
+    def generate_json(
+        self, prompt: str, schema: dict, images: list[bytes] | None = None
+    ) -> dict:
+        images = images or []
+        cache_file = _cache_dir() / f"{_cache_key(self.backend, self.model, prompt, schema, images)}.json"
+        if cache_file.exists():
+            return json.loads(cache_file.read_text())
+
+        content: list[dict[str, Any]] = []
+        text = f"{prompt}\n\nEmit ONLY valid JSON matching this schema: {json.dumps(schema, sort_keys=True)}"
+        content.append({"type": "text", "text": text})
+        for img in images:
+            import base64
+
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{base64.b64encode(img).decode()}"},
+            })
+        body = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.2,
+            "max_tokens": 2000,
+        }
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                res = httpx.post(
+                    OPENROUTER_URL,
+                    headers={"Authorization": f"Bearer {self._key}"},
+                    json=body,
+                    timeout=LLM_TIMEOUT,
+                )
+                if res.status_code in (401, 403):
+                    raise LlmError("OpenRouter rejected the API key. Check it in Settings.")
+                if res.status_code == 402:
+                    raise LlmError("OpenRouter has no credits left on this key — top up at openrouter.ai.")
+                if res.status_code == 429:
+                    import time
+
+                    retry_after = res.headers.get("retry-after")
+                    wait = float(retry_after) if retry_after and retry_after.isdigit() else 4 * (attempt + 1)
+                    time.sleep(wait)
+                    continue
+                res.raise_for_status()
+                payload = res.json()
+                # OpenRouter reports account-level problems inside a 200 body.
+                if payload.get("error"):
+                    raise LlmError(f"OpenRouter: {payload['error']}")
+                text = payload["choices"][0]["message"]["content"]
+                data = json.loads(_strip_fences(text))
+                cache_file.write_text(json.dumps(data))
+                return data
+            except LlmError:
+                raise
+            except (httpx.HTTPError, KeyError, json.JSONDecodeError, IndexError) as err:
+                last_err = err
+        raise LlmError(f"OpenRouter call failed after retries: {last_err}")
+
+
+class BedrockClient:
+    """Amazon Bedrock via the AWS SDK default credential chain.
+
+    No key arguments on purpose: local resolves `aws login`; the VPS/CI
+    resolves an attached role. Default model amazon.nova-pro-v1:0 is a
+    text+vision model inside AWS founder credits; override with
+    PUBLIKCLIP_BEDROCK_MODEL (e.g. a registry-approved GLM id).
+    """
+
+    backend = "bedrock"
+    supports_vision = True
+
+    def __init__(self, model: str | None = None):
+        self.model = model or BEDROCK_MODEL
+        try:
+            import boto3  # noqa: PLC0415 — lazy so Ollama-only installs never need AWS SDK
+        except ImportError as err:
+            raise LlmError(
+                "boto3 is not installed — add it to the pipeline environment to use "
+                "Bedrock (or switch to openrouter/ollama mode)."
+            ) from err
+        self._boto3 = boto3
+
+    def generate_json(
+        self, prompt: str, schema: dict, images: list[bytes] | None = None
+    ) -> dict:
+        images = images or []
+        cache_file = _cache_dir() / f"{_cache_key(self.backend, self.model, prompt, schema, images)}.json"
+        if cache_file.exists():
+            return json.loads(cache_file.read_text())
+
+        content: list[dict[str, Any]] = [{"text": prompt}]
+        for img in images:
+            content.append({"image": {"format": "jpeg", "source": {"bytes": img}}})
+        messages = [{"role": "user", "content": content}]
+        try:
+            client = self._boto3.client(
+                "bedrock-runtime",
+                region_name=os.environ.get("PUBLIKCLIP_BEDROCK_REGION") or os.environ.get("AWS_REGION", "us-east-1"),
+            )
+            resp = client.converse(
+                modelId=self.model,
+                messages=messages,
+                inferenceConfig={"temperature": 0.2, "maxTokens": 2000},
+            )
+            text = resp["output"]["message"]["content"][0]["text"]
+            data = json.loads(_strip_fences(text))
+        except LlmError:
+            raise
+        except Exception as err:  # noqa: BLE001 — surface SDK/auth/parse failures as one actionable error
+            raise LlmError(
+                f"Bedrock call failed ({self.model}): {err}. Run `aws login` locally "
+                "or set an attached role on the host."
+            ) from err
+        cache_file.write_text(json.dumps(data))
+        return data
+
+
 def make_client(llm_mode: str):
     if llm_mode == "ollama":
         return OllamaClient()
+    if llm_mode == "openrouter":
+        return OpenRouterClient()
+    if llm_mode == "bedrock":
+        return BedrockClient()
     return GeminiClient()

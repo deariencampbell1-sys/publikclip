@@ -167,7 +167,7 @@ class ScoreStage(Stage):
         finalists = scored[:SELECT_COUNT]
 
         # T2 visual pass + music brief on finalists only.
-        supports_vision = client.backend == "gemini"
+        supports_vision = bool(getattr(client, "supports_vision", False))
         for j, entry in enumerate(finalists):
             ctx.emit(0.6 + j / max(1, len(finalists)) * 0.35, f"Visual pass {j + 1}/{len(finalists)}…")
             visual = None

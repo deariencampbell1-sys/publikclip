@@ -134,7 +134,6 @@ def test_bedrock_converse_shape_and_cache(tmp_path, monkeypatch):
 
 
 def test_vision_flags():
-    assert llm.GeminiClient.supports_vision
     assert llm.OpenRouterClient.supports_vision
     assert llm.BedrockClient.supports_vision
     assert not llm.OllamaClient.supports_vision
@@ -143,11 +142,15 @@ def test_vision_flags():
 def test_make_client_routing(tmp_path, monkeypatch):
     _patch_home(tmp_path, monkeypatch)
     monkeypatch.setenv("PUBLIKCLIP_OPENROUTER_API_KEY", "sk-or-test")
-    monkeypatch.setenv("PUBLIKCLIP_GEMINI_API_KEY", "ai-fake")
     assert llm.make_client("openrouter").backend == "openrouter"
     with patch.dict("sys.modules", {"boto3": MagicMock()}):
         assert llm.make_client("bedrock").backend == "bedrock"
-    assert llm.make_client("gemini").backend == "gemini"
+    try:
+        llm.make_client("bogus")
+        raise AssertionError("expected LlmError for unknown mode")
+    except llm.LlmError as err:
+        assert "Unknown llm_mode" in str(err)
+    assert llm.make_client("gemini").backend == "openrouter"  # legacy jobs map to openrouter
     fake_tags = httpx.Response(
         200,
         json={"models": [{"name": "llama3.1:8b"}]},

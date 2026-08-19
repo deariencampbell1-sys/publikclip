@@ -1,5 +1,5 @@
-"""LLM backends: OpenRouter (default), Bedrock (founder credits), Gemini
-(legacy), and Ollama (local fallback).
+"""LLM backends: OpenRouter (default), Bedrock (founder credits), and Ollama
+(local fallback).
 
 One interface: generate_json(prompt, schema, images) → dict, with disk
 caching keyed on (backend, model, prompt, schema, images) so re-runs never
@@ -12,8 +12,6 @@ Key resolution per backend:
 - bedrock: boto3 default credential chain (no key arguments, matches the
   RHOBEAR gateway seam). Model from PUBLIKCLIP_BEDROCK_MODEL (default
   amazon.nova-pro-v1:0), region from PUBLIKCLIP_BEDROCK_REGION or AWS_REGION.
-- gemini (legacy): PUBLIKCLIP_GEMINI_API_KEY env var, then secrets.json
-  {"gemini_api_key": "..."} (written by the app's onboarding).
 - ollama: no key — just a running daemon.
 """
 
@@ -29,11 +27,6 @@ import httpx
 
 from .. import config
 
-# The rolling alias, deliberately: Google retires pinned models for NEW api
-# keys while still advertising them in ListModels (learned live — 404 "no
-# longer available to new users" on gemini-2.5-flash with a fresh key).
-GEMINI_MODEL = "gemini-flash-latest"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = os.environ.get("PUBLIKCLIP_OPENROUTER_MODEL", "z-ai/glm-4.5v")
 BEDROCK_MODEL = os.environ.get("PUBLIKCLIP_BEDROCK_MODEL", "amazon.nova-pro-v1:0")
@@ -43,19 +36,6 @@ LLM_TIMEOUT = 120.0
 
 class LlmError(Exception):
     """User-actionable LLM failure (bad key, daemon down, model missing)."""
-
-
-def gemini_api_key() -> str | None:
-    key = os.environ.get("PUBLIKCLIP_GEMINI_API_KEY")
-    if key:
-        return key
-    secrets_path = config.home_dir() / "secrets.json"
-    if secrets_path.exists():
-        try:
-            return json.loads(secrets_path.read_text()).get("gemini_api_key")
-        except (json.JSONDecodeError, OSError):
-            return None
-    return None
 
 
 def _cache_dir() -> Path:
@@ -82,82 +62,6 @@ def _strip_fences(text: str) -> str:
         if text.rstrip().endswith("```"):
             text = text.rstrip()[:-3]
     return text.strip()
-
-
-class GeminiClient:
-    backend = "gemini"
-    supports_vision = True
-
-    def __init__(self, model: str = GEMINI_MODEL):
-        self.model = model
-        key = gemini_api_key()
-        if not key:
-            raise LlmError(
-                "No Gemini API key found. Add one in Settings (or set "
-                "PUBLIKCLIP_GEMINI_API_KEY), or switch to Ollama mode."
-            )
-        self._key = key
-
-    def generate_json(
-        self, prompt: str, schema: dict, images: list[bytes] | None = None
-    ) -> dict:
-        images = images or []
-        cache_file = _cache_dir() / f"{_cache_key(self.backend, self.model, prompt, schema, images)}.json"
-        if cache_file.exists():
-            return json.loads(cache_file.read_text())
-
-        parts: list[dict[str, Any]] = [{"text": prompt}]
-        for img in images:
-            import base64
-
-            parts.append(
-                {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(img).decode()}}
-            )
-        body = {
-            "contents": [{"parts": parts}],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "responseSchema": schema,
-                "temperature": 0.2,
-            },
-        }
-        last_err: Exception | None = None
-        for attempt in range(3):
-            try:
-                res = httpx.post(
-                    GEMINI_URL.format(model=self.model),
-                    params={"key": self._key},
-                    json=body,
-                    timeout=LLM_TIMEOUT,
-                )
-                if res.status_code in (401, 403):
-                    raise LlmError("Gemini rejected the API key. Check it in Settings.")
-                if res.status_code == 429:
-                    import time
-
-                    # Surface the API's own words — a quota backoff and a
-                    # "credits depleted" billing stop look identical as bare
-                    # 429s but need opposite user actions.
-                    try:
-                        detail = res.json()["error"]["message"]
-                    except Exception:  # noqa: BLE001
-                        detail = "rate limited"
-                    last_err = LlmError(f"Gemini 429: {detail}")
-                    if "credit" in detail.lower() or "billing" in detail.lower():
-                        raise last_err
-                    time.sleep(4 * (attempt + 1))
-                    continue
-                res.raise_for_status()
-                payload = res.json()
-                text = payload["candidates"][0]["content"]["parts"][0]["text"]
-                data = json.loads(_strip_fences(text))
-                cache_file.write_text(json.dumps(data))
-                return data
-            except LlmError:
-                raise
-            except (httpx.HTTPError, KeyError, json.JSONDecodeError, IndexError) as err:
-                last_err = err
-        raise LlmError(f"Gemini call failed after retries: {last_err}")
 
 
 class OllamaClient:
@@ -375,10 +279,14 @@ class BedrockClient:
 
 
 def make_client(llm_mode: str):
+    if llm_mode == "gemini":  # jobs created before the provider swap
+        llm_mode = "openrouter"
     if llm_mode == "ollama":
         return OllamaClient()
     if llm_mode == "openrouter":
         return OpenRouterClient()
     if llm_mode == "bedrock":
         return BedrockClient()
-    return GeminiClient()
+    raise LlmError(
+        f"Unknown llm_mode {llm_mode!r} — use openrouter, bedrock, or ollama."
+    )

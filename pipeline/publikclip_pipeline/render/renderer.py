@@ -139,10 +139,15 @@ def crop_expr(boxes: list[tuple[int, int, int, int]], fps: float, src_w: int, sr
         ny = min(max(int(round(cy - h0 / 2)), 0), src_h - h0)
         nx -= nx % 2
         ny -= ny % 2
-        if prev is None or nx != prev[0] or ny != prev[1]:
+        if prev is None:
             x_pairs.append((t, nx))
             y_pairs.append((t, ny))
-            prev = (nx, ny)
+        else:
+            if nx != prev[0]:
+                x_pairs.append((t, nx))
+            if ny != prev[1]:
+                y_pairs.append((t, ny))
+        prev = (nx, ny)
     x0 = x_pairs[0][1] if x_pairs else 0
     y0 = y_pairs[0][1] if y_pairs else 0
     xe = _piecewise_expr(x_pairs[1:], x0)
@@ -150,7 +155,7 @@ def crop_expr(boxes: list[tuple[int, int, int, int]], fps: float, src_w: int, sr
     return f"crop=w={w0}:h={h0}:x='{xe}':y='{ye}'"
 
 
-MAX_CHANGE_POINTS = 140  # ffmpeg av_expr nesting limit sits ~150-200 on this build
+MAX_CHANGE_POINTS = 70  # ffmpeg av_expr nesting: 90 ok / 100 fails on this build
 
 
 def _chunk_boxes(

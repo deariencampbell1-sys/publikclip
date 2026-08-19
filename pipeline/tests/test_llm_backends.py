@@ -133,6 +133,49 @@ def test_bedrock_converse_shape_and_cache(tmp_path, monkeypatch):
     fake_client.converse.assert_not_called()
 
 
+def test_openrouter_schema_echo_retries_then_fails(tmp_path, monkeypatch):
+    """GLM-4.5V echoed the schema on image calls; the client must retry once
+    with an anti-echo instruction, then fail cleanly instead of returning a
+    schema-shaped dict that crashes composite()."""
+    _patch_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("PUBLIKCLIP_OPENROUTER_API_KEY", "sk-or-test")
+    schema = {
+        "type": "object",
+        "properties": {"visual_interest": {"type": "integer"}},
+        "required": ["visual_interest"],
+    }
+    echo = json.dumps(schema)
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(kwargs["json"])
+        body = kwargs["json"]
+        # First call: model echoes the schema. After the anti-echo retry: valid.
+        if "never repeat the schema" not in body["messages"][0]["content"][0]["text"]:
+            content = echo
+        else:
+            content = '{"visual_interest": 7}'
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]}, request=httpx.Request("POST", url))
+
+    with patch.object(llm.httpx, "post", side_effect=fake_post):
+        client = llm.OpenRouterClient()
+        result = client.generate_json("rate frames", schema, images=[b"img"])
+    assert result == {"visual_interest": 7}
+    assert len(calls) == 2
+
+    # If the model keeps echoing, the client must raise, not return garbage.
+    def fake_post_always_echo(url, **kwargs):
+        return httpx.Response(200, json={"choices": [{"message": {"content": echo}}]}, request=httpx.Request("POST", url))
+
+    with patch.object(llm.httpx, "post", side_effect=fake_post_always_echo):
+        try:
+            # Different prompt → no cache hit → the model keeps echoing → must raise.
+            llm.OpenRouterClient().generate_json("rate frames again", schema, images=[b"img"])
+            raise AssertionError("expected LlmError")
+        except llm.LlmError as err:
+            assert "missing required keys" in str(err)
+
+
 def test_vision_flags():
     assert llm.OpenRouterClient.supports_vision
     assert llm.BedrockClient.supports_vision

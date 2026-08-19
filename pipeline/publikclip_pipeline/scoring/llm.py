@@ -64,6 +64,28 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
+def _required_keys(schema: dict) -> list[str]:
+    return [k for k in schema.get("required", []) if isinstance(k, str)]
+
+
+def _validated(data: Any, schema: dict) -> dict:
+    """Reject LLM responses that miss schema-required keys.
+
+    Some models echo the schema definition back instead of answering with
+    values (observed with GLM-4.5V on image calls). A schema-shaped dict has
+    "properties"/"required"/"type" and none of the required fields — treat
+    it as a failed call, never as a score.
+    """
+    if not isinstance(data, dict):
+        raise LlmError("LLM response is not a JSON object")
+    required = _required_keys(schema)
+    if required and not all(k in data for k in required):
+        raise LlmError(f"LLM response missing required keys: {sorted(set(required) - set(data))}")
+    if "properties" in data and "type" in data and not required:
+        raise LlmError("LLM echoed the schema instead of answering")
+    return data
+
+
 class OllamaClient:
     backend = "ollama"
     supports_vision = False
@@ -185,8 +207,18 @@ class OpenRouterClient:
             "max_tokens": 2000,
         }
         last_err: Exception | None = None
+        retried_with_anti_echo = False
         for attempt in range(3):
             try:
+                body = dict(body)
+                if retried_with_anti_echo:
+                    body["messages"] = [{
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": text + " IMPORTANT: answer with the values only — never repeat the schema definition.",
+                        }] + content[1:],
+                    }]
                 res = httpx.post(
                     OPENROUTER_URL,
                     headers={"Authorization": f"Bearer {self._key}"},
@@ -211,6 +243,13 @@ class OpenRouterClient:
                     raise LlmError(f"OpenRouter: {payload['error']}")
                 text = payload["choices"][0]["message"]["content"]
                 data = json.loads(_strip_fences(text))
+                try:
+                    data = _validated(data, schema)
+                except LlmError:
+                    if not retried_with_anti_echo:
+                        retried_with_anti_echo = True
+                        continue
+                    raise
                 cache_file.write_text(json.dumps(data))
                 return data
             except LlmError:
@@ -266,7 +305,7 @@ class BedrockClient:
                 inferenceConfig={"temperature": 0.2, "maxTokens": 2000},
             )
             text = resp["output"]["message"]["content"][0]["text"]
-            data = json.loads(_strip_fences(text))
+            data = _validated(json.loads(_strip_fences(text)), schema)
         except LlmError:
             raise
         except Exception as err:  # noqa: BLE001 — surface SDK/auth/parse failures as one actionable error

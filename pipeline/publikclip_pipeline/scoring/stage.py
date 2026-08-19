@@ -186,6 +186,10 @@ class ScoreStage(Stage):
                         )
                     except Exception:  # noqa: BLE001 — visual is optional evidence
                         visual = None
+            if visual is not None and not isinstance(visual, dict):
+                visual = None  # optional evidence — never let a bad response kill the job
+            if visual is not None and visual.get("visual_interest") is None:
+                visual = None
             entry["t2"] = visual
 
             platform_scores, comp_adjustments = rubric.composite(

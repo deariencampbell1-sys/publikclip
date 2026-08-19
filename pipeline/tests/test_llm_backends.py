@@ -230,6 +230,7 @@ def test_auto_ladder_falls_through_to_working_backend(tmp_path, monkeypatch):
         client = llm.make_client("auto")
         assert client.generate_json("p", {}) == {"ok": 1}
         assert client.generate_json("p2", {}) == {"ok": 1}
+        assert client.model == "auto→openrouter"  # audit trail names the serving backend
 
     # bedrock attempted (converse), gateway attempted (502), openrouter answered twice.
     assert fake_client.converse.call_count == 2

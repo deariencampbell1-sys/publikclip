@@ -427,6 +427,7 @@ class AutoClient:
     def __init__(self):
         self._clients: list = []
         self._errors: list[str] = []
+        self._active: str | None = None
         for factory in (BedrockClient, GatewayClient, OpenRouterClient):
             try:
                 self._clients.append(factory())
@@ -435,13 +436,22 @@ class AutoClient:
         if not self._clients:
             raise LlmError("no LLM backends available: " + "; ".join(self._errors))
 
+    @property
+    def model(self) -> str:
+        """Audit label: which backend actually served (or the ladder)."""
+        if self._active:
+            return f"auto→{self._active}"
+        return "auto(bedrock→gateway→openrouter)"
+
     def generate_json(
         self, prompt: str, schema: dict, images: list[bytes] | None = None
     ) -> dict:
         errors = list(self._errors)
         for client in self._clients:
             try:
-                return client.generate_json(prompt, schema, images)
+                result = client.generate_json(prompt, schema, images)
+                self._active = client.backend
+                return result
             except LlmError as err:
                 errors.append(f"{client.backend}: {err}")
         raise LlmError("all LLM backends failed: " + "; ".join(errors))

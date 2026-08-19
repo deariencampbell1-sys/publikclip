@@ -1,10 +1,11 @@
-"""Clip renderer: one ffmpeg filter_complex per clip.
+"""Clip renderer: one ffmpeg filter chain per clip.
 
-The sendcmd architecture (vendored from mutonby/openshorts punch_in.py +
-reframe_v2.py, MIT): the director's per-frame trajectory array becomes a
+The camera trajectory (per-frame crop rects, punches included) becomes a
 deduped sendcmd command file driving a labeled crop filter — hard cuts are
 just discontinuities in the same array, pans are smooth regions, punch-ins
-already live in the w/h values. One decode, one encode:
+already live in the w/h values. If that path fails or hangs on a given
+ffmpeg build, a zoom-free fallback (constant window, x/y expressions)
+still produces the clip.
 
     sendcmd → crop@c → scale 1080x1920 → subtitles burn → loudnorm
 
@@ -111,43 +112,40 @@ def _piecewise_expr(pairs: list[tuple[float, int]], default: int) -> str:
     return expr
 
 
-def crop_expr(boxes: list[tuple[int, int, int, int]], fps: float) -> str:
-    """Per-parameter piecewise time expressions replacing the sendcmd file.
+def crop_expr(boxes: list[tuple[int, int, int, int]], fps: float, src_w: int, src_h: int) -> str:
+    """Zoom-free fallback crop: constant window, x/y piecewise expressions.
 
-    sendcmd (a command file driving a labeled crop) deadlocks the filter
-    graph on some ffmpeg builds — the render hangs mid-encode with the
-    output file frozen. The crop filter evaluates expressions per frame
-    with ``t`` (frame PTS in seconds), so the same change-point trajectory
-    can be expressed directly: no command file, no external state, no hang.
+    ffmpeg's crop filter cannot change its output size mid-stream — reinit
+    against a decoder input fails with "Failed to configure input pad" — so
+    w/h must stay constant. We fix the window at the largest box (normal
+    framing) and recenter it on each box's focal center, which keeps the
+    trajectory's pans and hard cuts while giving up punch-in zoom (that's
+    the sendcmd path's job — the primary renderer).
     """
-    # Change-points per parameter, starting from boxes[0] at t=0.
-    w_pairs: list[tuple[float, int]] = []
-    h_pairs: list[tuple[float, int]] = []
+    if not boxes:
+        boxes = [(src_w, src_h, 0, 0)]
+    w0 = max(b[0] for b in boxes)
+    h0 = max(b[1] for b in boxes)
     x_pairs: list[tuple[float, int]] = []
     y_pairs: list[tuple[float, int]] = []
-    prev: tuple[int, int, int, int] | None = None
+    prev: tuple[int, int] | None = None
     for i, (w, h, x, y) in enumerate(boxes):
         t = i / fps
-        if prev is None or w != prev[0]:
-            w_pairs.append((t, w))
-        if prev is None or h != prev[1]:
-            h_pairs.append((t, h))
-        if prev is None or x != prev[2]:
-            x_pairs.append((t, x))
-        if prev is None or y != prev[3]:
-            y_pairs.append((t, y))
-        prev = (w, h, x, y)
-
-    w0, h0, x0, y0 = boxes[0]
-    we = _piecewise_expr(w_pairs[1:], w0)
-    he = _piecewise_expr(h_pairs[1:], h0)
+        cx = x + w / 2
+        cy = y + h / 2
+        nx = min(max(int(round(cx - w0 / 2)), 0), src_w - w0)
+        ny = min(max(int(round(cy - h0 / 2)), 0), src_h - h0)
+        nx -= nx % 2
+        ny -= ny % 2
+        if prev is None or nx != prev[0] or ny != prev[1]:
+            x_pairs.append((t, nx))
+            y_pairs.append((t, ny))
+            prev = (nx, ny)
+    x0 = x_pairs[0][1] if x_pairs else 0
+    y0 = y_pairs[0][1] if y_pairs else 0
     xe = _piecewise_expr(x_pairs[1:], x0)
     ye = _piecewise_expr(y_pairs[1:], y0)
-    # crop evaluates its expressions per frame with `t` = frame PTS (s) —
-    # no eval= option (that's an overlay/geq thing). Trajectory change-points
-    # become nested if(lt(t,T),v,...) per parameter. No sendcmd file → no
-    # filter-graph deadlock.
-    return f"crop=w='{we}':h='{he}':x='{xe}':y='{ye}'"
+    return f"crop=w={w0}:h={h0}:x='{xe}':y='{ye}'"
 
 
 def render_clip(
@@ -170,38 +168,65 @@ def render_clip(
         boxes = [(src_h * 9 // 16 // 2 * 2, src_h - src_h % 2, 0, 0)]
     fps = float(trajectory.get("fps", 25))
 
-    vf_parts = [
-        crop_expr(boxes, fps),
+    # Primary: sendcmd-driven labeled crop (preserves punch-in zoom; proven
+    # end-to-end on this box). Fallback: constant-window expression crop
+    # (zoom-free; never reinitializes the filter graph mid-stream).
+    cmd_path = out_path.with_suffix(".cmd")
+    cmd_path.write_text("\n".join(sendcmd_lines(boxes, fps)) + "\n")
+    w0, h0, x0, y0 = boxes[0]
+    sendcmd_vf = [
+        f"sendcmd=f={_q(cmd_path)}",
+        f"crop@c=w={w0}:h={h0}:x={x0}:y={y0}",
         f"scale={OUT_W}:{OUT_H}:flags=lanczos",
         "setsar=1",
     ]
-    if ass_path is not None:
-        sub = f"subtitles=filename={_q(ass_path)}"
-        if fonts_dir is not None:
-            sub += f":fontsdir={_q(fonts_dir)}"
-        vf_parts.append(sub)
+    expr_vf = [
+        crop_expr(boxes, fps, src_w, src_h),
+        f"scale={OUT_W}:{OUT_H}:flags=lanczos",
+        "setsar=1",
+    ]
+    for vf in (sendcmd_vf, expr_vf):
+        if ass_path is not None:
+            sub = f"subtitles=filename={_q(ass_path)}"
+            if fonts_dir is not None:
+                sub += f":fontsdir={_q(fonts_dir)}"
+            vf.append(sub)
 
     if videotoolbox_available():
         vcodec = ["-c:v", "h264_videotoolbox", "-b:v", VT_BITRATE, "-allow_sw", "1"]
     else:
         vcodec = ["-c:v", "libx264", "-preset", "medium", "-crf", str(X264_CRF)]
 
-    args = [
-        ffmpeg_bin.ffmpeg(), "-y", "-v", "error",
-        "-ss", f"{clip_start:.3f}", "-t", f"{duration:.3f}",
-        "-i", media_path,
-        "-vf", ",".join(vf_parts),
-        "-af", f"loudnorm=I={lufs}:TP={true_peak}:LRA=11",
-        *vcodec,
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-        "-movflags", "+faststart",
-        "-map_metadata", "-1",  # metadata scrub (openshorts ffmpeg_utils)
-        str(out_path),
-    ]
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    if proc.returncode != 0:
-        raise RuntimeError(f"Render failed: {(proc.stderr or '')[-800:]}")
+    def _run(vf: list[str]) -> None:
+        args = [
+            ffmpeg_bin.ffmpeg(), "-y", "-v", "error",
+            "-ss", f"{clip_start:.3f}", "-t", f"{duration:.3f}",
+            "-i", media_path,
+            "-vf", ",".join(vf),
+            "-af", f"loudnorm=I={lufs}:TP={true_peak}:LRA=11",
+            *vcodec,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart",
+            "-map_metadata", "-1",  # metadata scrub (openshorts ffmpeg_utils)
+            str(out_path),
+        ]
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        if proc.returncode != 0:
+            raise RuntimeError(f"Render failed: {(proc.stderr or '')[-800:]}")
+
+    try:
+        _run(sendcmd_vf)
+    except (RuntimeError, subprocess.TimeoutExpired) as primary_err:
+        try:
+            _run(expr_vf)
+        except (RuntimeError, subprocess.TimeoutExpired) as fallback_err:
+            raise RuntimeError(
+                f"Render failed on both paths (sendcmd: {primary_err}; "
+                f"zoom-free: {fallback_err})"
+            ) from fallback_err
+    finally:
+        cmd_path.unlink(missing_ok=True)
 
 
 def verify_output(out_path: Path, expected_duration: float) -> dict:

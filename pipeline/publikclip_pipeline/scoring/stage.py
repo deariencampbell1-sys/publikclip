@@ -3,7 +3,7 @@ frames on the finalists → per-platform composites + music briefs, all with
 full provenance (decision #3).
 
 Cost shape: ~35 T1 text calls + ~12 T2 vision calls + ~12 music calls per
-video on Gemini Flash. In Ollama mode T2 is skipped (recorded as a missing
+video on the LLM backend. In Ollama mode T2 is skipped (recorded as a missing
 signal) and scores are labeled local-estimate."""
 
 from __future__ import annotations
@@ -208,7 +208,7 @@ class ScoreStage(Stage):
             )
             entry["signals_fired"] = fired
             entry["signals_missing"] = missing
-            entry["confidence"] = "standard" if client.backend == "gemini" else "local-estimate"
+            entry["confidence"] = "standard" if client.backend != "ollama" else "local-estimate"
 
             prior_mood = music_brief.mood_prior(window_events, entry["arousal_pct"])
             try:

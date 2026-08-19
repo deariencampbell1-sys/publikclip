@@ -250,7 +250,11 @@ fn list_job_dirs() -> Result<Vec<Value>, String> {
 }
 
 #[tauri::command]
-fn save_gemini_key(key: String) -> Result<bool, String> {
+fn save_llm_key(kind: String, key: String) -> Result<bool, String> {
+    let kind = kind.trim().to_string();
+    if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("invalid key kind".into());
+    }
     let home = home_dir();
     fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     let path = home.join("secrets.json");
@@ -258,7 +262,7 @@ fn save_gemini_key(key: String) -> Result<bool, String> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!({}));
-    current["gemini_api_key"] = json!(key.trim());
+    current[format!("{kind}_api_key")] = json!(key.trim());
     fs::write(&path, serde_json::to_string_pretty(&current).unwrap()).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
@@ -271,13 +275,13 @@ fn save_gemini_key(key: String) -> Result<bool, String> {
 #[tauri::command]
 fn get_setup_state() -> Result<Value, String> {
     let secrets = home_dir().join("secrets.json");
-    let has_key = fs::read_to_string(&secrets)
+    let has_openrouter = fs::read_to_string(&secrets)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .map(|v| v["gemini_api_key"].as_str().map(|k| !k.is_empty()).unwrap_or(false))
+        .map(|v| v["openrouter_api_key"].as_str().map(|k| !k.is_empty()).unwrap_or(false))
         .unwrap_or(false);
     let onboarded = home_dir().join("onboarded").exists();
-    Ok(json!({"has_gemini_key": has_key, "onboarded": onboarded}))
+    Ok(json!({"has_openrouter_key": has_openrouter, "onboarded": onboarded}))
 }
 
 #[tauri::command]
@@ -476,7 +480,7 @@ fn main() {
             resume_job,
             job_results,
             list_job_dirs,
-            save_gemini_key,
+            save_llm_key,
             get_setup_state,
             mark_onboarded,
             check_ollama,

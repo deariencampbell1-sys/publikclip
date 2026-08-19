@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 from . import ffmpeg_bin
@@ -148,6 +149,53 @@ def crop_expr(boxes: list[tuple[int, int, int, int]], fps: float, src_w: int, sr
     return f"crop=w={w0}:h={h0}:x='{xe}':y='{ye}'"
 
 
+MAX_CHANGE_POINTS = 140  # ffmpeg av_expr nesting limit sits ~150-200 on this build
+
+
+def _chunk_boxes(
+    boxes: list[tuple[int, int, int, int]], fps: float
+) -> list[dict]:
+    """Split a box trajectory into render chunks under the expression-depth
+    limit. A change point is a frame where x or y differs from the previous
+    frame (w/h are constant in the zoom-free path), so smooth pans burn one
+    change point per frame. Greedy: accumulate frames until either parameter
+    would exceed MAX_CHANGE_POINTS, then close the chunk.
+    """
+    chunks: list[dict] = []
+    start = 0
+    x_prev = boxes[0][2]
+    y_prev = boxes[0][3]
+    x_changes = 0
+    y_changes = 0
+    for i, (w, h, x, y) in enumerate(boxes):
+        if i == 0:
+            continue
+        if x != x_prev:
+            x_changes += 1
+            x_prev = x
+        if y != y_prev:
+            y_changes += 1
+            y_prev = y
+        if x_changes >= MAX_CHANGE_POINTS or y_changes >= MAX_CHANGE_POINTS:
+            chunks.append({
+                "t0": start / fps,
+                "t1": i / fps,
+                "boxes": boxes[start : i + 1],
+            })
+            start = i
+            x_prev = boxes[i][2]
+            y_prev = boxes[i][3]
+            x_changes = 0
+            y_changes = 0
+    if start < len(boxes):
+        chunks.append({
+            "t0": start / fps,
+            "t1": len(boxes) / fps,
+            "boxes": boxes[start:],
+        })
+    return chunks
+
+
 def render_clip(
     media_path: str,
     out_path: Path,
@@ -168,65 +216,121 @@ def render_clip(
         boxes = [(src_h * 9 // 16 // 2 * 2, src_h - src_h % 2, 0, 0)]
     fps = float(trajectory.get("fps", 25))
 
-    # Primary: sendcmd-driven labeled crop (preserves punch-in zoom; proven
-    # end-to-end on this box). Fallback: constant-window expression crop
-    # (zoom-free; never reinitializes the filter graph mid-stream).
-    cmd_path = out_path.with_suffix(".cmd")
-    cmd_path.write_text("\n".join(sendcmd_lines(boxes, fps)) + "\n")
-    w0, h0, x0, y0 = boxes[0]
-    sendcmd_vf = [
-        f"sendcmd=f={_q(cmd_path)}",
-        f"crop@c=w={w0}:h={h0}:x={x0}:y={y0}",
-        f"scale={OUT_W}:{OUT_H}:flags=lanczos",
-        "setsar=1",
-    ]
-    expr_vf = [
-        crop_expr(boxes, fps, src_w, src_h),
-        f"scale={OUT_W}:{OUT_H}:flags=lanczos",
-        "setsar=1",
-    ]
-    for vf in (sendcmd_vf, expr_vf):
-        if ass_path is not None:
-            sub = f"subtitles=filename={_q(ass_path)}"
-            if fonts_dir is not None:
-                sub += f":fontsdir={_q(fonts_dir)}"
-            vf.append(sub)
-
     if videotoolbox_available():
         vcodec = ["-c:v", "h264_videotoolbox", "-b:v", VT_BITRATE, "-allow_sw", "1"]
     else:
         vcodec = ["-c:v", "libx264", "-preset", "medium", "-crf", str(X264_CRF)]
 
-    def _run(vf: list[str]) -> None:
+    # Expression-depth limit: nested if(lt(t,T),...) breaks past ~150-200
+    # levels on this ffmpeg build, and sendcmd deadlocks at scale — so the
+    # trajectory renders in chunks that stay under the depth budget and the
+    # parts are concatenated. crop's `t` rebases to ~0 after each -ss input
+    # seek (verified), so per-chunk expressions are correct; setpts restores
+    # absolute PTS before the subtitles filter so caption timing survives
+    # the chunking.
+    chunks = _chunk_boxes(boxes, fps)
+    part_paths: list[Path] = []
+    try:
+        for chunk in chunks:
+            part = out_path.with_name(f"{out_path.stem}.p{len(part_paths)}.mp4")
+            part_paths.append(part)
+            _render_chunk(
+                media_path, part,
+                clip_start + chunk["t0"], chunk["t1"] - chunk["t0"],
+                chunk["boxes"], fps, clip_start + chunk["t0"],
+                ass_path, fonts_dir, lufs, true_peak, src_w, src_h,
+                timeout, vcodec,
+            )
+        _concat_parts(part_paths, out_path)
+    finally:
+        for part in part_paths:
+            part.unlink(missing_ok=True)
+
+
+def _render_chunk(
+    media_path: str,
+    out_path: Path,
+    start: float,
+    duration: float,
+    boxes: list[tuple[int, int, int, int]],
+    fps: float,
+    absolute_start: float,
+    ass_path: Path | None,
+    fonts_dir: Path | None,
+    lufs: float,
+    true_peak: float,
+    src_w: int,
+    src_h: int,
+    timeout: float,
+    vcodec: list[str],
+) -> None:
+    vf = [
+        crop_expr(boxes, fps, src_w, src_h),
+        f"setpts=PTS+{absolute_start:.4f}",
+        f"scale={OUT_W}:{OUT_H}:flags=lanczos",
+        "setsar=1",
+    ]
+    if ass_path is not None:
+        sub = f"subtitles=filename={_q(ass_path)}"
+        if fonts_dir is not None:
+            sub += f":fontsdir={_q(fonts_dir)}"
+        vf.append(sub)
+
+    args = [
+        ffmpeg_bin.ffmpeg(), "-y", "-v", "error",
+        "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+        "-i", media_path,
+        "-vf", ",".join(vf),
+        "-af", f"loudnorm=I={lufs}:TP={true_peak}:LRA=11",
+        *vcodec,
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-map_metadata", "-1",  # metadata scrub (openshorts ffmpeg_utils)
+        str(out_path),
+    ]
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # No-progress watchdog: a deadlocked filter graph leaves the output file
+    # frozen while the process lives. Kill it so the caller can move on.
+    last_size = -1
+    stale_for = 0.0
+    while proc.poll() is None:
+        size = out_path.stat().st_size if out_path.exists() else 0
+        if size != last_size:
+            last_size = size
+            stale_for = 0.0
+        else:
+            stale_for += 10.0
+        if stale_for >= 120.0:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(
+                f"Render stalled (output frozen for {stale_for:.0f}s) — killed."
+            )
+        time.sleep(10)
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"Render failed: {(stderr or '')[-800:]}")
+
+
+def _concat_parts(parts: list[Path], out_path: Path) -> None:
+    """Stream-copy concat of identically-encoded chunk parts."""
+    list_path = out_path.with_suffix(".concat.txt")
+    list_path.write_text("".join(f"file '{str(part).replace(chr(92), '/')}'\n" for part in parts))
+    try:
         args = [
             ffmpeg_bin.ffmpeg(), "-y", "-v", "error",
-            "-ss", f"{clip_start:.3f}", "-t", f"{duration:.3f}",
-            "-i", media_path,
-            "-vf", ",".join(vf),
-            "-af", f"loudnorm=I={lufs}:TP={true_peak}:LRA=11",
-            *vcodec,
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-f", "concat", "-safe", "0",
+            "-i", str(list_path),
+            "-c", "copy",
             "-movflags", "+faststart",
-            "-map_metadata", "-1",  # metadata scrub (openshorts ffmpeg_utils)
+            "-map_metadata", "-1",
             str(out_path),
         ]
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=600)
         if proc.returncode != 0:
-            raise RuntimeError(f"Render failed: {(proc.stderr or '')[-800:]}")
-
-    try:
-        _run(sendcmd_vf)
-    except (RuntimeError, subprocess.TimeoutExpired) as primary_err:
-        try:
-            _run(expr_vf)
-        except (RuntimeError, subprocess.TimeoutExpired) as fallback_err:
-            raise RuntimeError(
-                f"Render failed on both paths (sendcmd: {primary_err}; "
-                f"zoom-free: {fallback_err})"
-            ) from fallback_err
+            raise RuntimeError(f"Concat failed: {(proc.stderr or '')[-500:]}")
     finally:
-        cmd_path.unlink(missing_ok=True)
+        list_path.unlink(missing_ok=True)
 
 
 def verify_output(out_path: Path, expected_duration: float) -> dict:

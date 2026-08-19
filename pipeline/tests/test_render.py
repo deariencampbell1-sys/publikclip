@@ -91,6 +91,25 @@ def test_crop_expr_constant_window_recenters_on_focal_center():
     assert "if(lt(t,0.2000),100" in expr
 
 
+def test_chunk_boxes_stays_under_depth_budget():
+    """Smooth pans burn one change point per frame; chunks must cap below
+    the ffmpeg expression-depth limit (~150-200)."""
+    fps = 30.0
+    n = 1000  # 33s of per-frame pan
+    boxes = [(404, 720, 100 + i % 8, 0) for i in range(n)]
+    chunks = renderer._chunk_boxes(boxes, fps)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        xs = [b[2] for b in chunk["boxes"]]
+        changes = sum(1 for a, b in zip(xs, xs[1:]) if a != b)
+        assert changes <= renderer.MAX_CHANGE_POINTS
+    # Contiguous: chunk boundaries tile the full timeline.
+    assert chunks[0]["t0"] == 0.0
+    assert abs(chunks[-1]["t1"] - n / fps) < 1e-6
+    for a, b in zip(chunks, chunks[1:]):
+        assert abs(a["t1"] - b["t0"]) < 1e-6
+
+
 def test_render_smoke(tmp_path):
     """Full path: synthetic source → sendcmd crop with a mid-clip cut →
     caption burn → verified 9:16 output."""
